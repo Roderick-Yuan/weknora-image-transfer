@@ -1,0 +1,407 @@
+# =============================================================================
+# ghcr-bridge-export.yml
+# GHCR Bridge —— 官方 Docker Hub 镜像按固定 digest 中转至 GHCR
+#
+# 与 offline-image-export.yml 的关系：
+#   - 复用同一套 regctl v0.11.7 固定来源、同样的 Registry 身份核验逻辑、
+#     同样的 tar 结构核验逻辑；
+#   - 交接方式由 "Actions Artifact 传大文件（受 500 MB 存储配额限制）"
+#     改为 "Runner 推送到 GHCR，本机再从 GHCR 导出 tar"；
+#     大文件不再经过 Artifact，本工作流只上传几 KB 的身份证据。
+#
+# 本轮只中转 WeKnora App 一个镜像（试运行）。
+# DocReader / ParadeDB 的固定清单保留在 IMAGE_LIST_WITH_DIGEST.json，
+# 启用方式见 GHCR_BRIDGE_STEPS.md，未经批准不得擅自加入。
+#
+# 触发：仅 workflow_dispatch。无 push / PR / schedule / 自动重试。
+# 引擎：不使用 Docker Engine（不需要 docker pull / push / save / load）。
+# 凭据：仅使用自动提供的 GITHUB_TOKEN，工作流内不写入任何密钥。
+# =============================================================================
+
+name: ghcr-bridge-export
+
+run-name: "GHCR bridge ${{ inputs.make_public && '(PUBLIC)' || '(private)' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      make_public:
+        description: '是否把 GHCR 包设为 public。**公开后不可再改回 private，且等于公开发布镜像，须先取得批准。**'
+        required: false
+        default: false
+        type: boolean
+      evidence_retention_days:
+        description: '身份证据（几 KB）的 Artifact 保留天数'
+        required: false
+        default: '5'
+        type: string
+
+# 最小权限：默认只读。packages: write 与 actions: write 在 job 级单独授予。
+permissions:
+  contents: read
+
+concurrency:
+  group: ghcr-bridge-export
+  cancel-in-progress: false
+
+env:
+  # ---- regctl 官方来源固定值（regclient v0.11.7 Release）----
+  REGCTL_VERSION: 'v0.11.7'
+  REGCTL_ASSET: 'regctl-linux-amd64'
+  REGCTL_EXPECTED_BYTES: '12947580'
+  REGCTL_EXPECTED_SHA256: '3737FBBDD791E04E7A831640B681F3397A376498E80E2AD9B1B2D27296F239BC'
+  REGCTL_SIGSTORE_LOG_INDEX: '3346365438'
+
+jobs:
+  bridge:
+    name: "Bridge ${{ matrix.id }} -> GHCR"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write      # 推送 GHCR 所需
+      actions: write       # 上传几 KB 身份证据所需
+
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          # ---- 本轮仅启用 A（WeKnora App 试运行）----
+          - id: 'A-weknora-app'
+            repository: 'docker.io/wechatopenai/weknora-app'
+            tag: 'v0.8.3'
+            tag_index_or_manifest_digest: 'sha256:b5f96b13c2f69779af8c7291264cafbda64c208398b019e3a6223c6f3ea82031'
+            amd64_manifest_digest: 'sha256:28739bcf58a8f8e0fd3f5c120329d2ec538128ce52295ffb46ca47e0deee62c1'
+            config_digest: 'sha256:6f66d56dc139b3404e8e484058d1398e111351c746c99410a489d0891b66f6e0'
+            compressed_layer_bytes: '579786071'
+            ghcr_package: 'weknora-app'
+          # ---- 以下两项本轮不启用；需另行授权后再取消注释 ----
+          # - id: 'B-weknora-docreader'
+          #   repository: 'docker.io/wechatopenai/weknora-docreader'
+          #   tag: 'v0.8.3'
+          #   tag_index_or_manifest_digest: 'sha256:9af668ac0ac857b9dfe8430d0fe77c0e5ad2636dc2b5285cd5500a13d5a35266'
+          #   amd64_manifest_digest: 'sha256:ee308c6d69f278619794bd5f42af1d78624efefb57dce345e5d00d12798b19fa'
+          #   config_digest: 'sha256:2e53ece9f2a1caa9acef4b54e70cc9f079ef0c2f3103abca9f372e44a6f67df0'
+          #   compressed_layer_bytes: '1576625369'
+          #   ghcr_package: 'weknora-docreader'
+          # - id: 'C-paradedb'
+          #   repository: 'docker.io/paradedb/paradedb'
+          #   tag: 'v0.25.11-pg17'
+          #   tag_index_or_manifest_digest: 'sha256:78d65750f0f88a56548526201bcab9910f83b90fe929cdbf979890f3f80b0f95'
+          #   amd64_manifest_digest: 'sha256:07356fcbfdf68c446a964dd378b6d89af901b7737de6f514da5c2b81a0c23118'
+          #   config_digest: 'sha256:15742e72fbdcfe94199fbb364725ccf73e60b13a704cdc28fbcecb1ad7254407'
+          #   compressed_layer_bytes: '366838441'
+          #   ghcr_package: 'paradedb'
+
+    env:
+      REPO: ${{ matrix.repository }}
+      TAG: ${{ matrix.tag }}
+      TAG_DIGEST: ${{ matrix.tag_index_or_manifest_digest }}
+      AMD64_DIGEST: ${{ matrix.amd64_manifest_digest }}
+      CONFIG_DIGEST: ${{ matrix.config_digest }}
+      GHCR_PACKAGE: ${{ matrix.ghcr_package }}
+      WORKDIR: ${{ runner.temp }}/bridge/${{ matrix.id }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REG_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      # ------------------------------------------------------------------
+      # 0. 前置：磁盘空间（不自动升级付费 Runner，不足即失败并报告）
+      # ------------------------------------------------------------------
+      - name: "[0/7] Preflight - runner disk space"
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORKDIR"
+          df -h / || true
+          avail_bytes=$(df --output=avail -k / | tail -n1 | awk '{print $1*1024}')
+          need_bytes=$(( ${{ matrix.compressed_layer_bytes }} * 2 ))
+          echo "available_bytes = $avail_bytes"
+          echo "required_bytes  = $need_bytes  (compressed_layer_bytes * 2)"
+          if [ "$avail_bytes" -lt "$need_bytes" ]; then
+            echo "::error::Runner disk space insufficient. STOP - do not switch to a paid larger runner automatically."
+            exit 1
+          fi
+          echo "DISK_CHECK=PASS" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 1. 获取 regctl（官方 Release + 固定 SHA-256）
+      # ------------------------------------------------------------------
+      - name: "[1/7] Fetch regctl from official regclient Release"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP/tools"
+          url="https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/${REGCTL_ASSET}"
+          echo "url=$url"
+          curl -fsSL --retry 3 --retry-delay 5 --max-time 300 -o regctl "$url"
+          chmod +x regctl
+          actual_bytes=$(stat -c %s regctl)
+          actual_sha=$(sha256sum regctl | awk '{print toupper($1)}')
+          echo "expected_sha256= $REGCTL_EXPECTED_SHA256"
+          echo "actual_sha256  = $actual_sha"
+          if [ "$actual_bytes" != "$REGCTL_EXPECTED_BYTES" ] || [ "$actual_sha" != "$REGCTL_EXPECTED_SHA256" ]; then
+            echo "::error::regctl binary does not match the pinned official SHA-256. STOP."
+            exit 1
+          fi
+          ./regctl version | tee "$WORKDIR/regctl-version.txt"
+          echo "REGCTL_CHECK=PASS" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 2. 源镜像身份核验（Docker Hub 官方 Registry）
+      #    tag 若已漂移直接失败，不擅自接受新 digest。
+      # ------------------------------------------------------------------
+      - name: "[2/7] Verify SOURCE identity on Docker Hub"
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+          RC="$RUNNER_TEMP/tools/regctl"
+          SRC_REF="${REPO}@${AMD64_DIGEST}"
+
+          echo "### 2.1 tag -> linux/amd64 digest"
+          got="$("$RC" image digest --platform linux/amd64 "${REPO}:${TAG}")"
+          echo "actual  = $got"
+          echo "expected= $AMD64_DIGEST"
+          if [ "$got" != "$AMD64_DIGEST" ]; then
+            echo "::error::Tag ${REPO}:${TAG} now resolves to a different linux/amd64 digest. STOP - do not accept a new digest."
+            exit 1
+          fi
+
+          echo "### 2.2 manifest raw bytes -> sha256"
+          "$RC" manifest get "$SRC_REF" --format raw-body > source-manifest.json
+          m_sha="sha256:$(sha256sum source-manifest.json | awk '{print $1}')"
+          echo "manifest_bytes_sha256 = $m_sha"
+          if [ "$m_sha" != "$AMD64_DIGEST" ]; then
+            echo "::error::Source manifest bytes digest mismatch. STOP."
+            exit 1
+          fi
+
+          echo "### 2.3 config digest"
+          c="$(jq -r '.config.digest' source-manifest.json)"
+          echo "actual  = $c"
+          echo "expected= $CONFIG_DIGEST"
+          if [ "$c" != "$CONFIG_DIGEST" ]; then
+            echo "::error::Source config digest mismatch. STOP."
+            exit 1
+          fi
+
+          echo "### 2.4 os/arch"
+          "$RC" image config "$SRC_REF" --format '{{json .}}' > source-config.json
+          os="$(jq -r '.os' source-config.json)"
+          arch="$(jq -r '.architecture' source-config.json)"
+          echo "os=$os architecture=$arch"
+          if [ "$os" != "linux" ] || [ "$arch" != "amd64" ]; then
+            echo "::error::Source platform is not linux/amd64. STOP."
+            exit 1
+          fi
+          echo "SOURCE_IDENTITY_CHECK=PASS" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 3. 登录 GHCR + 按 digest 中转（只复制这一个 amd64 manifest）
+      # ------------------------------------------------------------------
+      - name: "[3/7] Login to GHCR and copy image by digest"
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+          RC="$RUNNER_TEMP/tools/regctl"
+          OWNER_LC="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "OWNER_LC=$OWNER_LC"
+          echo "$OWNER_LC" > owner.txt
+
+          echo "### 3.1 login (GITHUB_TOKEN, via stdin, no secret written to disk)"
+          printf '%s' "$REG_TOKEN" | "$RC" registry login ghcr.io -u "${{ github.actor }}" --pass-stdin
+
+          echo "### 3.2 copy: Docker Hub(digest) -> GHCR(tag)"
+          DST="ghcr.io/${OWNER_LC}/${GHCR_PACKAGE}:${TAG}"
+          echo "src=${REPO}@${AMD64_DIGEST}"
+          echo "dst=$DST"
+          echo "start_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          set +e
+          "$RC" image copy "${REPO}@${AMD64_DIGEST}" "$DST" 2>&1 | tee copy.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "exit=$rc"
+          echo "end_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::regctl image copy to GHCR failed (exit=$rc)."
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # 4. GHCR 目标身份核验：必须逐字节等于官方源 amd64 manifest digest
+      #    目标 digest 只有在等于源 digest 时才被认定为同一镜像；
+      #    不等于即失败，绝不把未验证的目标 digest 当作官方原始 digest。
+      # ------------------------------------------------------------------
+      - name: "[4/7] Verify GHCR TARGET identity equals source digest"
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+          RC="$RUNNER_TEMP/tools/regctl"
+          OWNER_LC="$(cat owner.txt)"
+          GHCR_TAG_REF="ghcr.io/${OWNER_LC}/${GHCR_PACKAGE}:${TAG}"
+
+          echo "### 4.1 GHCR tag -> digest"
+          ghcr_digest="$("$RC" image digest "$GHCR_TAG_REF")"
+          echo "ghcr_digest = $ghcr_digest"
+          echo "source      = $AMD64_DIGEST"
+          if [ "$ghcr_digest" != "$AMD64_DIGEST" ]; then
+            echo "::error::GHCR target digest differs from the official source digest. STOP - not the same image."
+            exit 1
+          fi
+
+          echo "### 4.2 GHCR manifest bytes -> sha256"
+          "$RC" manifest get "$GHCR_TAG_REF" --format raw-body > ghcr-manifest.json
+          g_sha="sha256:$(sha256sum ghcr-manifest.json | awk '{print $1}')"
+          echo "ghcr_manifest_bytes_sha256 = $g_sha"
+          if [ "$g_sha" != "$AMD64_DIGEST" ]; then
+            echo "::error::GHCR manifest bytes digest mismatch. STOP."
+            exit 1
+          fi
+
+          echo "### 4.3 GHCR config digest"
+          gc="$(jq -r '.config.digest' ghcr-manifest.json)"
+          echo "actual  = $gc"
+          echo "expected= $CONFIG_DIGEST"
+          if [ "$gc" != "$CONFIG_DIGEST" ]; then
+            echo "::error::GHCR config digest mismatch. STOP."
+            exit 1
+          fi
+
+          echo "### 4.4 源 / 目标 manifest 字节一致性"
+          if cmp -s source-manifest.json ghcr-manifest.json; then
+            echo "manifest_bytes_identical=true"
+          else
+            echo "::error::Source and GHCR manifest bytes are not identical. STOP."
+            exit 1
+          fi
+
+          echo "### 4.5 GHCR os/arch"
+          "$RC" image config "$GHCR_TAG_REF" --format '{{json .}}' > ghcr-config.json
+          g_os="$(jq -r '.os' ghcr-config.json)"
+          g_arch="$(jq -r '.architecture' ghcr-config.json)"
+          echo "os=$g_os architecture=$g_arch"
+          if [ "$g_os" != "linux" ] || [ "$g_arch" != "amd64" ]; then
+            echo "::error::GHCR platform is not linux/amd64. STOP."
+            exit 1
+          fi
+          echo "GHCR_IDENTITY_CHECK=PASS (target digest verified EQUAL to official source digest)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 5. 可见性：GHCR 容器包默认即为 private；默认不动它。
+      #    仅当显式勾选 make_public 才设为 public（不可逆，需事先批准）。
+      # ------------------------------------------------------------------
+      - name: "[5/7] Package visibility (default private)"
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+          OWNER="$(cat owner.txt)"
+          echo "### 5.1 回读当前可见性（best effort）"
+          vis='NOT_VERIFIED'
+          if out="$(gh api -H "Accept: application/vnd.github+json" "/users/${OWNER}/packages/container/${GHCR_PACKAGE}" --jq '.visibility' 2>/dev/null)"; then
+            vis="$out"
+          elif out="$(gh api -H "Accept: application/vnd.github+json" "/orgs/${OWNER}/packages/container/${GHCR_PACKAGE}" --jq '.visibility' 2>/dev/null)"; then
+            vis="$out"
+          elif out="$(gh api -H "Accept: application/vnd.github+json" "/user/packages/container/${GHCR_PACKAGE}" --jq '.visibility' 2>/dev/null)"; then
+            vis="$out"
+          fi
+          echo "visibility=$vis"
+          echo "$vis" > visibility.txt
+          echo "### 5.2 说明：GHCR 容器包首次发布默认为 private，本步骤不主动改动可见性。"
+          echo "VISIBILITY_CHECK=$vis" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: "[5b/7] OPTIONAL - make package public (irreversible)"
+        if: ${{ inputs.make_public == true }}
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+          OWNER="$(cat owner.txt)"
+          echo "::warning::正在把 GHCR 包设为 public。公开后不可再改回 private，且等于公开发布镜像。仅限已取得批准的情况。"
+          gh api --method PATCH -H "Accept: application/vnd.github+json" \
+            "/users/${OWNER}/packages/container/${GHCR_PACKAGE}" -f visibility=public \
+          || gh api --method PATCH -H "Accept: application/vnd.github+json" \
+            "/orgs/${OWNER}/packages/container/${GHCR_PACKAGE}" -f visibility=public
+          echo "visibility=public" > visibility.txt
+
+      # ------------------------------------------------------------------
+      # 6. 生成交接证据（几 KB，不含镜像数据）
+      # ------------------------------------------------------------------
+      - name: "[6/7] Build bridge evidence JSON"
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+          OWNER_LC="$(cat owner.txt)"
+          vis="$(cat visibility.txt)"
+          jq -n \
+            --arg image_name "${{ matrix.id }}" \
+            --arg source_repository "$REPO" \
+            --arg tag "$TAG" \
+            --arg source_registry "registry-1.docker.io" \
+            --arg source_registry_digest "$TAG_DIGEST" \
+            --arg source_platform_manifest_digest "$AMD64_DIGEST" \
+            --arg config_digest "$CONFIG_DIGEST" \
+            --arg os "linux" \
+            --arg architecture "amd64" \
+            --arg ghcr_host "ghcr.io" \
+            --arg ghcr_reference "ghcr.io/${OWNER_LC}/${GHCR_PACKAGE}:${TAG}" \
+            --arg ghcr_digest_reference "ghcr.io/${OWNER_LC}/${GHCR_PACKAGE}@${AMD64_DIGEST}" \
+            --arg ghcr_target_digest "$AMD64_DIGEST" \
+            --arg ghcr_target_digest_status "VERIFIED_EQUAL_TO_SOURCE" \
+            --arg package_visibility "$vis" \
+            --arg bridge_timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg export_tool "regctl" \
+            --arg export_tool_version "$REGCTL_VERSION" \
+            --arg export_tool_sha256 "$REGCTL_EXPECTED_SHA256" \
+            --arg verification_status "PASS_PENDING_LOCAL_TAR_EXPORT" \
+            '{
+               image_name: $image_name,
+               source_repository: $source_repository,
+               tag: $tag,
+               source_registry: $source_registry,
+               source_registry_digest: $source_registry_digest,
+               source_platform_manifest_digest: $source_platform_manifest_digest,
+               config_digest: $config_digest,
+               os: $os,
+               architecture: $architecture,
+               ghcr_host: $ghcr_host,
+               ghcr_reference: $ghcr_reference,
+               ghcr_digest_reference: $ghcr_digest_reference,
+               ghcr_target_digest: $ghcr_target_digest,
+               ghcr_target_digest_status: $ghcr_target_digest_status,
+               package_visibility: $package_visibility,
+               bridge_timestamp: $bridge_timestamp,
+               export_tool: $export_tool,
+               export_tool_version: $export_tool_version,
+               export_tool_sha256: $export_tool_sha256,
+               verification_status: $verification_status,
+               note: "ghcr_target_digest 只有在与官方源 amd64 manifest digest 逐字节相等时才被采信；它不是独立获取的官方 digest。"
+             }' > bridge-handoff.json
+          cat bridge-handoff.json
+
+      - name: "[7/7] Upload evidence artifact (few KB only)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghcr-bridge-evidence-${{ matrix.ghcr_package }}
+          path: ${{ runner.temp }}/bridge/${{ matrix.id }}
+          retention-days: ${{ inputs.evidence_retention_days || '5' }}
+          if-no-files-found: error
+
+      - name: Job summary
+        if: always()
+        run: |
+          cd "$WORKDIR" || exit 0
+          OWNER_LC="$(cat owner.txt 2>/dev/null || echo '<owner>')"
+          {
+            echo "### ${{ matrix.id }} -> GHCR"
+            echo ""
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| 源 repository | \`${REPO}\` |"
+            echo "| tag | \`${TAG}\` |"
+            echo "| 官方源 amd64 manifest digest | \`${AMD64_DIGEST}\` |"
+            echo "| GHCR 引用 | \`ghcr.io/${OWNER_LC}/${GHCR_PACKAGE}:${TAG}\` |"
+            echo "| GHCR 目标 digest | \`${AMD64_DIGEST}\`（已核验与源相等） |"
+            echo "| 包可见性 | \`$(cat visibility.txt 2>/dev/null || echo NOT_VERIFIED)\` |"
+            echo "| 导出工具 | regctl ${REGCTL_VERSION} |"
+            echo ""
+            echo "本机导出：见 \`GHCR_BRIDGE_STEPS.md\` 第 4 节（用已校验的 regctl v0.11.7 从 GHCR 导出 tar 到 D:）。"
+          } >> "$GITHUB_STEP_SUMMARY"
