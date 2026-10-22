@@ -101,7 +101,7 @@ jobs:
       AMD64_DIGEST: ${{ matrix.amd64_manifest_digest }}
       CONFIG_DIGEST: ${{ matrix.config_digest }}
       GHCR_PACKAGE: ${{ matrix.ghcr_package }}
-      WORKDIR: ${{ runner.temp }}/bridge/${{ matrix.id }}
+      WORKDIR: /tmp/bridge/${{ matrix.id }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REG_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -381,7 +381,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ghcr-bridge-evidence-${{ matrix.ghcr_package }}
-          path: ${{ runner.temp }}/bridge/${{ matrix.id }}
+          path: /tmp/bridge/${{ matrix.id }}
           retention-days: ${{ inputs.evidence_retention_days || '5' }}
           if-no-files-found: error
 
